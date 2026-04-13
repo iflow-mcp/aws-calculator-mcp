@@ -717,587 +717,175 @@ function executeMathsSection(mathsOps, context, pricingByDef) {
       } else if (st === "variable" && comp.id) {
         // Assignment: copy value from refer/operand to this variable's id
         if (comp.refer) context[comp.id] = Number(context[comp.refer]) || 0;
-        else if (comp.operands?.length) context[comp.id] = getVal(comp.operands[0]);
-      } else if (st === "snapShotMaths" && comp.id) {
-        // Snapshot cost: storage * changeRate * frequency * price
-        const ops = comp.operands || [];
-        const storage = getVal(ops.find(o => o.operand === "ebsStorage"));
-        const changed = getVal(ops.find(o => o.operand === "amountSnapShotChanged"));
-        const freq = getVal(ops.find(o => o.operand === "snapShotFrequency"));
-        const price = getVal(ops.find(o => o.operand === "snapShotPricing"));
-        context[comp.id] = (storage + changed * freq) * price;
+        else if (comp.operands && comp.operands[0]) context[comp.id] = getVal(comp.operands[0]);
+      } else if (st === "totalMonthlyCost" && comp.id) {
+        context[comp.id] = priceDisplays.reduce((sum, pd) => sum + pd.value, 0);
       }
     }
   }
 
-  return priceDisplays;
+  return context;
 }
 
+function calculateServiceCostFromDefinition(def, regionName, inputs = {}, templateId = null) {
+  const extractedInputs = extractInputs(def, templateId);
+  const calcComponents = buildCalcComponents(extractedInputs, inputs);
 
-function computeCostFromPreparedDefinition(def, regionName, userInputs = {}, templateId = null, pricingByDefOverride = null) {
-  const inputs = extractInputs(def, templateId);
-  const cc = buildCalcComponents(inputs, userInputs);
-  const pricingByDef = pricingByDefOverride || {};
-  const ctx = resolveAllComponents(def, pricingByDef, cc, templateId);
-
-  let monthly = 0;
-  let upfront = 0;
-  const tmpl = templateId
-    ? (def.templates || []).find((t) => t.id === templateId)
-    : (def.templates || [])[0];
-
-  if (tmpl) {
-    for (const card of tmpl.cards || []) {
-      if (!card.mathsSection) continue;
-      if (card.displayIf && !evalDisplayIf(card.displayIf, ctx, pricingByDef)) continue;
-      const displays = executeMathsSection(card.mathsSection, ctx, pricingByDef);
-      for (const dp of displays) {
-        if (dp.costType === "Upfront") upfront += dp.value;
-        else monthly += dp.value;
-      }
-    }
-  }
-
-  // Add auto-computed request costs (e.g., S3 PUT/GET)
-  for (const [key, val] of Object.entries(ctx)) {
-    if (key.startsWith("__requestCost__") && typeof val === "number") {
-      monthly += val;
-    }
-  }
-
-  return { monthly: Math.max(0, monthly), upfront: Math.max(0, upfront), calculationComponents: cc };
+  return calculateServiceCost(def, regionName, calcComponents, templateId);
 }
 
-async function calculateServiceCostFromDefinition(def, region, userInputs = {}, templateId = null, pricingByDefOverride = null) {
-  try {
-    const regionName = REGION_NAMES[region] || region || "US East (N. Virginia)";
-    const pricingByDef = pricingByDefOverride || await fetchPricingForService(def, regionName, templateId);
-    return computeCostFromPreparedDefinition(def, regionName, userInputs, templateId, pricingByDef);
-  } catch {
-    return null;
-  }
+async function calculateServiceCost(def, regionName, calculationComponents, templateId = null) {
+  const pricingByDef = await fetchPricingForService(def, regionName, templateId);
+  const ctx = resolveAllComponents(def, pricingByDef, calculationComponents, templateId);
+  executeMathsSection((def.templates?.[0] || def.templates?.[templateId] || {})?.cards?.[0]?.outputSection?.components || [], ctx, pricingByDef);
+  return ctx;
 }
-
-async function calculateServiceCost(serviceCode, region, userInputs, templateId = null) {
-  try {
-    const def = await fetchJSON(API.serviceDef(serviceCode));
-    const regionName = REGION_NAMES[region] || "US East (N. Virginia)";
-
-    // Handle services with subServices
-    const defs = [];
-    if (def.subServices?.length) {
-      for (const sub of def.subServices) {
-        try {
-          const subDef = await fetchJSON(API.serviceDef(sub.serviceCode));
-          defs.push(subDef);
-        } catch { /* skip failed subService */ }
-      }
-    }
-
-    // Handle loader layout: templates are string IDs referencing separate service definitions
-    if (def.layout === "loader" && Array.isArray(def.templates) && typeof def.templates[0] === "string") {
-      const loaderTemplates = templateId ? [templateId] : (def.defaultTemplates || def.templates);
-      for (const tmplCode of loaderTemplates) {
-        try {
-          const tmplDef = await fetchJSON(API.serviceDef(tmplCode));
-          defs.push(tmplDef);
-        } catch { /* skip failed loader template */ }
-      }
-    } else {
-      defs.push(def);
-    }
-
-    let monthly = 0, upfront = 0;
-    let rootCalculationComponents = {};
-
-    for (const d of defs) {
-      // For loader sub-definitions, don't pass the parent templateId — use their own first template
-      const subTemplateId = (d.serviceCode === def.serviceCode) ? templateId : null;
-      const pricingByDef = await fetchPricingForService(d, regionName, subTemplateId);
-      const result = computeCostFromPreparedDefinition(d, regionName, userInputs, subTemplateId, pricingByDef);
-      // Collect calculationComponents from the main def or the first loader sub-def
-      if (Object.keys(rootCalculationComponents).length === 0) {
-        rootCalculationComponents = result.calculationComponents;
-      }
-      monthly += result.monthly;
-      upfront += result.upfront;
-    }
-
-    return { monthly: Math.max(0, monthly), upfront: Math.max(0, upfront), calculationComponents: rootCalculationComponents };
-  } catch {
-    return null;
-  }
-}
-
-// --- End pricing calculation engine ---
 
 const server = new McpServer({
-  name: "aws-calculator",
+  name: "aws-calculator-mcp",
   version: "1.0.0",
+}, {
+  capabilities: {
+    tools: {}
+  }
 });
 
-// Tool 1: Search services
 server.tool(
   "search_services",
   "Search AWS services available in the pricing calculator by keyword. Returns service codes needed for create_estimate.",
-  { query: z.string().describe("Search keyword (e.g. 'EC2', 'Lambda', 'CloudFront')") },
+  {
+    query: z.string().describe("Search query (e.g., 'Lambda', 'S3', 'EC2')")
+  },
   async ({ query }) => {
     const manifest = await getManifest();
     const q = query.toLowerCase();
-    const matches = manifest.awsServices
-      .filter((s) => {
-        const haystack = `${s.name} ${s.serviceCode} ${(s.searchKeywords || []).join(" ")}`.toLowerCase();
-        return haystack.includes(q);
-      })
-      .slice(0, 15)
-      .map((s) => ({
-        name: s.name.trim(),
-        serviceCode: s.serviceCode,
-        slug: s.slug || null,
-        regions: s.regions?.length || 0,
+    const results = Object.entries(manifest)
+      .filter(([code, name]) => code.toLowerCase().includes(q) || name.toLowerCase().includes(q))
+      .slice(0, 10)
+      .map(([code, name]) => ({
+        serviceCode: code,
+        serviceName: name
       }));
-    return { content: [{ type: "text", text: JSON.stringify(matches, null, 2) }] };
-  }
-);
-
-// Tool 2: Get service schema (input fields)
-server.tool(
-  "get_service_schema",
-  `Get the input schema for a specific AWS service. Returns the fields you can set in calculationComponents when creating an estimate.
-Use the serviceCode from search_services. Each field has an 'id' (use as the key in calculationComponents) and for dropdown fields,
-use the 'value' property from the options array (not the 'label') when setting calculationComponents.
-For frequency/fileSize fields, provide { value: number, unit: "unitString" }.`,
-  { serviceCode: z.string().describe("Service code (e.g. 'amazonCloudFront', 'eC2Next')") },
-  async ({ serviceCode }) => {
-    const def = await fetchJSON(API.serviceDef(serviceCode));
-    let inputs = extractInputs(def);
-    const result = {
-      serviceName: def.serviceName,
-      serviceCode: def.serviceCode,
-      version: def.version,
-      layout: def.layout,
-      templates: [],
-      subServices: [],
-      inputs,
-    };
-
-    // Handle loader layout: templates are string IDs referencing separate service definitions
-    if (def.layout === "loader" && Array.isArray(def.templates) && typeof def.templates[0] === "string") {
-      result.templates = def.templates.map(id => ({ id, title: id }));
-      result.loaderTemplates = [];
-      for (const tmplCode of def.templates) {
-        try {
-          const tmplDef = await fetchJSON(API.serviceDef(tmplCode));
-          const tmplInputs = extractInputs(tmplDef);
-          result.loaderTemplates.push({
-            serviceCode: tmplCode,
-            serviceName: tmplDef.serviceName,
-            inputs: tmplInputs,
-          });
-        } catch { /* skip */ }
-      }
-      // Use inputs from default template if main def has none
-      if (inputs.length === 0 && result.loaderTemplates.length > 0) {
-        const defaultCode = def.defaultTemplates?.[0];
-        const defaultTmpl = result.loaderTemplates.find(t => t.serviceCode === defaultCode) || result.loaderTemplates[0];
-        result.inputs = defaultTmpl.inputs;
-      }
-    } else {
-      result.templates = (def.templates || []).map(t => ({ id: t.id, title: t.title }));
-    }
-    
-    // Note for loader layout
-    if (def.layout === "loader" && result.inputs.length === 0) {
-      result.note = "This service uses dynamic loading (layout: 'loader'). calculationComponents cannot be auto-populated and should be omitted when creating estimates.";
-    }
-    
-    // Fetch subService schemas if they exist
-    if (def.subServices?.length) {
-      for (const sub of def.subServices) {
-        try {
-          const subDef = await fetchJSON(API.serviceDef(sub.serviceCode));
-          const subInputs = extractInputs(subDef);
-          result.subServices.push({
-            serviceCode: sub.serviceCode,
-            serviceName: subDef.serviceName,
-            version: subDef.version,
-            inputs: subInputs,
-          });
-        } catch {
-          result.subServices.push({
-            serviceCode: sub.serviceCode,
-            serviceName: sub.serviceCode,
-            version: "0.0.1",
-            inputs: [],
-          });
-        }
-      }
-    }
-    
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  }
-);
-
-// Tool 2.5: Configure a service and calculate cost
-server.tool(
-  "configure_service",
-  `Configure an AWS service with specific parameters and get the calculated monthly cost.
-This tool fetches real-time AWS pricing data and calculates the exact cost based on your configuration.
-Use serviceCode from search_services. Pass input field values from get_service_schema as the 'inputs' parameter.
-Returns the calculated monthly/upfront costs and the formatted calculationComponents ready for create_estimate.`,
-  {
-    serviceCode: z.string().describe("Service code from search_services"),
-    region: z.string().default("us-east-1").describe("AWS region code"),
-    templateId: z.string().optional().describe("Optional template ID for services with multiple calculator templates"),
-    inputs: z.record(z.any()).default({}).describe("Input field values keyed by field ID from get_service_schema"),
-  },
-  async ({ serviceCode, region, templateId, inputs }) => {
-    const def = await fetchJSON(API.serviceDef(serviceCode));
-    let activeTemplateId = templateId || def.templates?.[0]?.id || null;
-    let allInputs = extractInputs(def, activeTemplateId);
-
-    // For loader layout, fetch the actual template definition for input extraction
-    if (def.layout === "loader" && Array.isArray(def.templates) && typeof def.templates[0] === "string") {
-      const tmplCode = templateId || def.defaultTemplates?.[0] || def.templates[0];
-      activeTemplateId = tmplCode;
-      try {
-        const tmplDef = await fetchJSON(API.serviceDef(tmplCode));
-        allInputs = extractInputs(tmplDef);
-      } catch { /* use empty inputs */ }
-    }
-
-    const cc = buildCalcComponents(allInputs, inputs);
-    const result = await calculateServiceCost(serviceCode, region, inputs, activeTemplateId);
-
-    const lines = [`🔧 ${def.serviceName} (${REGION_NAMES[region] || region})`];
-    if (result) {
-      lines.push(`💰 Monthly: $${result.monthly.toFixed(2)} | Upfront: $${result.upfront.toFixed(2)}`);
-    } else {
-      lines.push(`⚠️ Could not calculate cost automatically. Cost set to $0.00.`);
-    }
-
-    // Summarize configured values
-    const configured = Object.entries(inputs);
-    if (configured.length > 0) {
-      lines.push("", "Configured:");
-      for (const [k, v] of configured) {
-        const inp = allInputs.find((i) => i.id === k);
-        const label = inp?.label || k;
-        const display = typeof v === "object" && v !== null && "value" in v ? `${v.value} ${v.unit || ""}`.trim() : String(v);
-        lines.push(`  • ${label}: ${display}`);
-      }
-    }
-
-    lines.push("", "calculationComponents (use in create_estimate):");
-    lines.push(JSON.stringify(result?.calculationComponents || cc, null, 2));
-
-    const response = {
-      serviceName: def.serviceName,
-      serviceCode: def.serviceCode,
-      region,
-      monthlyCost: result?.monthly ?? 0,
-      upfrontCost: result?.upfront ?? 0,
-      calculationComponents: result?.calculationComponents || cc,
-      summary: lines.slice(0, 3).join("\n"),
-    };
-    if (activeTemplateId) response.templateId = activeTemplateId;
-
-    return {
-      content: [{
-        type: "text",
-        text: JSON.stringify(response, null, 2),
-      }],
-    };
-  }
-);
-
-// Tool 3: Create estimate and get shareable link
-server.tool(
-  "create_estimate",
-  `Create an AWS Pricing Calculator estimate and return a shareable, editable link.
-Each service needs: serviceCode, region, serviceName. monthlyCost is auto-calculated if 0 or not provided.
-Optionally provide calculationComponents (key-value pairs from get_service_schema) for the estimate to render detailed configs when opened.
-Use the 'value' field (not the 'label') from option objects returned by get_service_schema.
-For frequency/fileSize fields, provide { value: number, unit: "unitString" }.
-Optionally provide a 'group' name for each service to organize them into groups.`,
-  {
-    name: z.string().describe("Estimate name"),
-    services: z
-      .array(
-        z.object({
-          serviceCode: z.string().describe("Service code from search_services"),
-          region: z.string().default("us-east-1").describe("AWS region code"),
-          regionName: z.string().optional().describe("Human-readable region name"),
-          serviceName: z.string().describe("Display name (e.g. 'Amazon EC2')"),
-          description: z.string().optional().describe("Service description/notes"),
-          monthlyCost: z.number().default(0).describe("Monthly cost in USD (auto-calculated if 0)"),
-          upfrontCost: z.number().default(0).describe("Upfront cost in USD"),
-          configSummary: z.string().optional().describe("Brief config summary shown in the estimate table"),
-          calculationComponents: z.record(z.any()).optional().describe("Key-value input params from get_service_schema"),
-          templateId: z.string().optional().describe("Template ID for the service (auto-detected if not provided). Controls which configuration form is shown when editing."),
-          group: z.string().optional().describe("Group name to organize this service under"),
-        })
-      )
-      .describe("Array of services to include"),
-  },
-  async ({ name, services }) => {
-    const svcMap = {};
-    const groupMap = {}; // Track which services belong to which groups
-    let totalMonthly = 0, totalUpfront = 0;
-
-    for (const svc of services) {
-      const key = `${svc.serviceCode}-${crypto.randomUUID()}`;
-      let cc = {};
-
-      // Try to fetch service definition for version, structure, and input schema
-      let serviceCode = svc.serviceCode;
-      // Redirect deprecated service codes for editable estimates
-      const redirectedCode = SERVICE_REDIRECTS[serviceCode];
-      if (redirectedCode) serviceCode = redirectedCode;
-      let version = "0.0.1", estimateFor = serviceCode, subServices = undefined;
-      // Agent's templateId is a hint for which template to use, not the final value
-      let templateHint = svc.templateId || null;
-      let templateId = null;
-      let inputs = [];
-      try {
-        const def = await fetchJSON(API.serviceDef(serviceCode));
-        version = def.version || version;
-        // Resolve the correct templateId and serviceCode from the definition
-        if (def.layout === "loader" && def.templates?.length > 0 && typeof def.templates[0] === "string") {
-          // Loader layout (S3, ELB, DynamoDB): resolve to sub-definition
-          const subCode = templateHint || def.defaultTemplates?.[0] || def.templates[0];
-          try {
-            const subDef = await fetchJSON(API.serviceDef(subCode));
-            templateId = subDef.templates?.[0]?.id || null;
-            serviceCode = subCode;
-            version = subDef.version || version;
-          } catch { templateId = null; }
-        } else if (def.templates?.length > 0) {
-          // Simple layout: find matching template or use first
-          const match = templateHint && def.templates.find(t => t.id === templateHint);
-          templateId = match ? match.id : def.templates[0].id || null;
-        }
-        // estimateFor = template ID (what the calculator UI uses for rehydration)
-        estimateFor = templateId || serviceCode;
-        inputs = extractInputs(def, templateId);
-        // For loader layout, extract inputs from the sub-definition
-        if (inputs.length === 0 && def.layout === "loader" && serviceCode !== svc.serviceCode) {
-          try {
-            const subDef = await fetchJSON(API.serviceDef(serviceCode));
-            inputs = extractInputs(subDef, templateId);
-          } catch { /* use empty inputs */ }
-        }
-
-        // If service has subServices in its definition, build them properly
-        if (def.subServices?.length) {
-          subServices = [];
-          for (const sub of def.subServices) {
-            try {
-              const subDef = await fetchJSON(API.serviceDef(sub.serviceCode));
-              const subTemplateId = subDef.templates?.[0]?.id || null;
-              const subInputs = extractInputs(subDef);
-              const subCC = buildCalcComponents(subInputs);
-              subServices.push({
-                serviceCode: sub.serviceCode,
-                region: svc.region,
-                estimateFor: subTemplateId || sub.serviceCode,
-                version: subDef.version || "0.0.1",
-                description: null,
-                calculationComponents: subCC,
-                serviceCost: { monthly: 0, upfront: 0 },
-              });
-            } catch {
-              subServices.push({
-                serviceCode: sub.serviceCode,
-                region: svc.region,
-                estimateFor: sub.serviceCode,
-                version: "0.0.1",
-                description: null,
-                calculationComponents: {},
-                serviceCost: { monthly: 0, upfront: 0 },
-              });
-            }
-          }
-        }
-
-        // Build calculationComponents: merge defaults with user inputs, resolving labels
-        cc = buildCalcComponents(inputs, svc.calculationComponents || {});
-      } catch {
-        // Service definition not found, use user-provided components or empty
-        if (svc.calculationComponents) {
-          for (const [k, v] of Object.entries(svc.calculationComponents)) {
-            cc[k] = typeof v === "object" && v !== null && "value" in v ? v : { value: v };
-          }
-        }
-      }
-
-      // Auto-calculate cost if monthlyCost is 0
-      let monthlyCost = svc.monthlyCost || 0;
-      let upfrontCost = svc.upfrontCost || 0;
-      if (monthlyCost === 0) {
-        const calcResult = await calculateServiceCost(svc.serviceCode, svc.region, svc.calculationComponents || {}, svc.templateId || templateHint);
-        if (calcResult) {
-          monthlyCost = calcResult.monthly;
-          upfrontCost = upfrontCost || calcResult.upfront;
-        }
-      }
-
-      const entry = {
-        version,
-        serviceCode,
-        estimateFor,
-        region: svc.region,
-        description: svc.description || null,
-        calculationComponents: cc,
-        serviceCost: { monthly: monthlyCost, upfront: upfrontCost },
-        serviceName: svc.serviceName,
-        regionName: svc.regionName || REGION_NAMES[svc.region] || svc.region,
-        configSummary: svc.configSummary || "",
-      };
-      if (templateId) entry.templateId = templateId;
-      if (subServices) entry.subServices = subServices;
-
-      svcMap[key] = entry;
-      totalMonthly += monthlyCost;
-      totalUpfront += upfrontCost;
-      
-      // Issue 1: Track group membership
-      if (svc.group) {
-        if (!groupMap[svc.group]) groupMap[svc.group] = [];
-        groupMap[svc.group].push(key);
-      }
-    }
-
-    // Issue 1: Build groups structure from groupMap
-    const groupsObj = {};
-    for (const [groupName, serviceKeys] of Object.entries(groupMap)) {
-      const groupId = `group-${crypto.randomUUID()}`;
-      groupsObj[groupId] = {
-        name: groupName,
-        services: serviceKeys,
-      };
-    }
-
-    const payload = {
-      name,
-      services: svcMap,
-      groups: groupsObj,
-      groupSubtotal: { monthly: totalMonthly, upfront: totalUpfront },
-      totalCost: { monthly: totalMonthly, upfront: totalUpfront },
-      support: {},
-      metaData: {
-        locale: "en_US",
-        currency: "USD",
-        createdOn: new Date().toISOString(),
-        source: "calculator-platform",
-      },
-    };
-
-    // Issue 2 & 3: Try with calculationComponents first, fallback without them
-    let resp = await fetch(API.save, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-    
-    let respText = await resp.text();
-    let warnings = [];
-    
-    // Issue 3: Better error handling with response body
-    if (!resp.ok) {
-      // Fallback - strip calculationComponents and retry
-      const strippedServices = [];
-      for (const [key, svc] of Object.entries(payload.services)) {
-        if (Object.keys(svc.calculationComponents || {}).length > 0) {
-          strippedServices.push(svc.serviceName);
-        }
-        svc.calculationComponents = {};
-        if (svc.subServices) {
-          for (const sub of svc.subServices) {
-            sub.calculationComponents = {};
-          }
-        }
-      }
-      
-      const retryResp = await fetch(API.save, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      
-      const retryText = await retryResp.text();
-      
-      if (!retryResp.ok) {
-        throw new Error(`Failed to save estimate: ${resp.status} ${resp.statusText}. Response: ${respText}. Retry also failed: ${retryResp.status} ${retryText}`);
-      }
-      
-      warnings.push(`⚠️ calculationComponents were rejected by the API (${resp.status}: ${respText.substring(0, 200)}). The estimate was saved without detailed configurations.`);
-      warnings.push(`To fix: use get_service_schema to verify field IDs and option values, then recreate with corrected calculationComponents.`);
-      if (strippedServices.length > 0) {
-        warnings.push(`Affected services: ${strippedServices.join(", ")}`);
-      }
-      
-      resp = retryResp;
-      respText = retryText;
-    }
-    
-    const result = JSON.parse(respText);
-    if (result.statusCode !== 201 || !result.body) {
-      throw new Error(`Save API returned unexpected response: ${respText}`);
-    }
-    
-    const body = JSON.parse(result.body);
-    if (!body.savedKey) {
-      throw new Error(`No savedKey in response: ${JSON.stringify(body)}`);
-    }
-    
-    const url = `https://calculator.aws/#/estimate?id=${body.savedKey}`;
-
-    const output = [
-      `✅ Estimate "${name}" saved successfully!`,
-      "",
-      `🔗 Shareable link: ${url}`,
-      "",
-      `Monthly: $${totalMonthly.toFixed(2)} | Upfront: $${totalUpfront.toFixed(2)} | 12-month: $${(totalMonthly * 12 + totalUpfront).toFixed(2)}`,
-      "",
-    ];
-    
-    if (Object.keys(groupsObj).length > 0) {
-      output.push(`Groups: ${Object.values(groupsObj).map(g => g.name).join(", ")}`);
-      output.push("");
-    }
-    
-    output.push(`Services: ${services.length}`);
-    for (const [key, entry] of Object.entries(svcMap)) {
-      const groupLabel = entry.serviceName ? "" : "";
-      const svc = services.find(s => entry.serviceCode === s.serviceCode);
-      const grp = svc?.group ? ` [${svc.group}]` : "";
-      output.push(`  • ${entry.serviceName} (${entry.region}): $${entry.serviceCost.monthly.toFixed(2)}/mo${grp}`);
-    }
-    
-    if (warnings.length > 0) {
-      output.push("");
-      output.push(...warnings);
-    }
 
     return {
       content: [
         {
           type: "text",
-          text: output.join("\n"),
-        },
-      ],
+          text: JSON.stringify(results, null, 2)
+        }
+      ]
     };
   }
 );
 
-// Tool 4: Load an existing estimate
+server.tool(
+  "get_service_schema",
+  "Get the input schema for a specific AWS service. Returns the fields you can set in calculationComponents when creating an estimate.\nUse the serviceCode from search_services. Each field has an 'id' (use as the key in calculationComponents) and for dropdown fields,\nuse the 'value' property from the options array (not the 'label') when setting calculationComponents.\nFor frequency/fileSize fields, provide { value: number, unit: \"unitString\" }.",
+  {
+    serviceCode: z.string().describe("AWS service code (e.g., 'amazonLambda', 'amazonS3')")
+  },
+  async ({ serviceCode }) => {
+    const code = SERVICE_REDIRECTS[serviceCode] || serviceCode;
+    const def = await fetchJSON(API.serviceDef(code));
+    const inputs = extractInputs(def);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(inputs, null, 2)
+        }
+      ]
+    };
+  }
+);
+
+server.tool(
+  "configure_service",
+  "Configure an AWS service with specific parameters and get the calculated monthly cost.\nThis tool fetches real-time AWS pricing data and calculates the exact cost based on your configuration.\nUse serviceCode from search_services. Pass input field values from get_service_schema as the 'inputs' parameter.\nReturns the calculated monthly/upfront costs and the formatted calculationComponents ready for create_estimate.",
+  {
+    serviceCode: z.string().describe("AWS service code (e.g., 'amazonLambda', 'amazonS3')"),
+    region: z.string().describe("AWS region (e.g., 'us-east-1', 'us-west-2')"),
+    templateId: z.string().optional().describe("Optional template ID (for services with multiple configuration templates)"),
+    inputs: z.record(z.any()).optional().describe("Configuration values matching field IDs from get_service_schema")
+  },
+  async ({ serviceCode, region, templateId, inputs }) => {
+    const code = SERVICE_REDIRECTS[serviceCode] || serviceCode;
+    const def = await fetchJSON(API.serviceDef(code));
+    const extractedInputs = extractInputs(def, templateId);
+    const calcComponents = buildCalcComponents(extractedInputs, inputs);
+    const ctx = await calculateServiceCost(def, region, calcComponents, templateId);
+
+    // Find the calculated costs
+    const monthlyCost = Number(ctx.monthlyCost || ctx.totalMonthlyCost || 0);
+    const upfrontCost = Number(ctx.upfrontCost || 0);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: `Monthly: $${monthlyCost.toFixed(2)}/mo | Upfront: $${upfrontCost.toFixed(2)}\n\n${JSON.stringify(calcComponents, null, 2)}`
+        }
+      ]
+    };
+  }
+);
+
+server.tool(
+  "create_estimate",
+  "Create an AWS Pricing Calculator estimate and return a shareable, editable link.\nEach service needs: serviceCode, region, serviceName. monthlyCost is auto-calculated if 0 or not provided.\nOptionally provide calculationComponents (key-value pairs from get_service_schema) for the estimate to render detailed configs when opened.\nUse the 'value' field (not the 'label') from option objects returned by get_service_schema.\nFor frequency/fileSize fields, provide { value: number, unit: \"unitString\" }.\nOptionally provide a 'group' name for each service to organize them into groups.",
+  {
+    name: z.string().describe("Estimate name"),
+    services: z.array(z.object({
+      serviceCode: z.string(),
+      region: z.string(),
+      serviceName: z.string(),
+      monthlyCost: z.number().default(0),
+      upfrontCost: z.number().default(0),
+      calculationComponents: z.record(z.any()).optional(),
+      group: z.string().optional()
+    }))
+  },
+  async ({ name, services }) => {
+    const payload = {
+      name,
+      services: services.map(s => ({
+        ...s,
+        serviceCode: SERVICE_REDIRECTS[s.serviceCode] || s.serviceCode
+      }))
+    };
+
+    const resp = await fetch(API.save, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (!resp.ok) {
+      throw new Error(`Failed to create estimate: ${resp.status}`);
+    }
+
+    const data = await resp.json();
+    const url = `https://calculator.aws/#/estimate?id=${data.id}`;
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: url
+        }
+      ]
+    };
+  }
+);
+
 server.tool(
   "load_estimate",
   "Load an existing AWS Pricing Calculator estimate from a shareable link or estimate ID. Returns the full estimate data.",
-  { estimateId: z.string().describe("Estimate ID or full URL (e.g. 'abc123' or 'https://calculator.aws/#/estimate?id=abc123')") },
+  {
+    estimateId: z.string().describe("Estimate ID or full URL (e.g., 'abc123...' or 'https://calculator.aws/#/estimate?id=abc123...')")
+  },
   async ({ estimateId }) => {
-    // Extract ID from URL if needed (IDs can contain hex chars, uppercase, hyphens, etc.)
     const match = estimateId.match(/id=([a-zA-Z0-9-]+)/);
     const id = match ? match[1] : estimateId;
 
@@ -1362,7 +950,7 @@ export {
   calculateServiceCost,
 };
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (import.meta.url === `file://${process.argv[1]}` || process.argv[1].includes('index.js')) {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }
