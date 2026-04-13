@@ -950,7 +950,6 @@ export {
   calculateServiceCost,
 };
 
-if (import.meta.url === `file://${process.argv[1]}` || process.argv[1].includes('index.js')) {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-}
+// Always start the server when run directly
+const transport = new StdioServerTransport();
+await server.connect(transport);
